@@ -126,25 +126,26 @@ def download(url):
 
 # ------------------------------------------------------------ parsing
 
+# The NBA PDF renders each header label as a single space-less token
+# ("GameDate", "PlayerName", "CurrentStatus", ...). Map those tokens to keys.
+HEADER_TOKENS = {
+    "GameDate": "game_date", "GameTime": "game_time", "Matchup": "matchup",
+    "Team": "team", "PlayerName": "player", "CurrentStatus": "status", "Reason": "reason",
+}
+
 def column_bounds(words):
-    """Locate the header row and return [(x_start, key)] sorted by x."""
+    """Locate the header row by its single-token labels; return [(x_start,key)]."""
     found = {}
-    for lab in HEADER_LABELS:
-        first = lab.split()[0]
-        for w in words:
-            if w["text"] == first:
-                # confirm full label by checking the following word when 2-part
-                if " " in lab:
-                    nxt = [u for u in words if abs(u["top"]-w["top"])<2 and u["x0"]>w["x0"]]
-                    nxt.sort(key=lambda u:u["x0"])
-                    if not nxt or not lab.endswith(nxt[0]["text"]):
-                        continue
-                found[lab] = w["x0"]
-                break
+    header_top = None
+    for w in words:
+        key = HEADER_TOKENS.get(w["text"])
+        if key:
+            found[key] = w["x0"]
+            header_top = w["top"]
     if len(found) < 5:
-        return None
-    cols = sorted(((x, COL_KEYS[HEADER_LABELS.index(lab)]) for lab, x in found.items()))
-    return cols
+        return None, None
+    cols = sorted((x, k) for k, x in found.items())
+    return cols, header_top
 
 def assign_col(cols, x):
     key = cols[0][1]
@@ -155,57 +156,102 @@ def assign_col(cols, x):
             break
     return key
 
+def _respace(t):
+    """The PDF has no space glyphs; reconstruct readable spacing."""
+    if not t:
+        return t
+    # space between a lowercase/']' and an uppercase letter:  NewYork -> New York
+    t = re.sub(r'(?<=[a-z\)\]\.;])(?=[A-Z])', ' ', t)
+    # space between a letter and a digit:  Right5th -> Right 5th
+    t = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', t)
+    # digit followed by a letter, but NOT ordinal suffixes (5th, 2nd, 3rd, 1st)
+    t = re.sub(r'(?<=\d)(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', ' ', t)
+    # space after a comma if missing:  Robinson,Mitchell -> Robinson, Mitchell
+    t = re.sub(r',(?=\S)', ', ', t)
+    # space around a dash used as separator:  Illness-RightHand -> Illness - Right Hand
+    t = re.sub(r'\s*-\s*', ' - ', t)
+    # collapse doubles
+    t = re.sub(r'\s{2,}', ' ', t)
+    return t.strip()
+
+ASSIGN_TOL = 30  # x tolerance for column assignment
+
 def parse_pdf(pdf_bytes):
-    """Return (entries, not_submitted_teams). entries: list of dicts."""
+    """Return (entries, not_submitted_teams) parsed from the real NBA layout.
+
+    The report has no space glyphs and wraps long Reason text across lines that
+    can sit slightly ABOVE or BELOW the player's row. Strategy: identify player
+    rows (a token in the Player column), then for each, gather Status from the
+    same line and Reason from every reason-column token within a vertical band.
+    """
     entries, not_submitted = [], []
-    carry = {k: "" for k in COL_KEYS}
-    cols = None
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
-            pc = column_bounds(words)
-            if pc: cols = pc
-            if not cols: continue
-            header_top = None
-            if pc:
-                for w in words:
-                    if w["text"] == "Game":
-                        header_top = w["top"]; break
-            # group words into rows by vertical position
-            rows = {}
-            for w in words:
-                if header_top is not None and w["top"] <= header_top + 2:
+            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+            hdr = [{"text": w["text"], "x0": w["x0"], "top": w["top"]} for w in words]
+            cols, header_top = column_bounds(hdr)
+            if not cols:
+                continue
+            colx = {k: x for x, k in cols}
+
+            def col_of(x):
+                best, bestd = None, 1e9
+                for cx, ck in cols:
+                    d = abs(x - cx)
+                    if d < bestd:
+                        bestd, best = d, ck
+                return best
+
+            body = [w for w in words if header_top is None or w["top"] > header_top + 3]
+            body = [w for w in body if not w["text"].lower().startswith("page")]
+
+            # player-row anchors: tokens assigned to the player column
+            players = [w for w in body if col_of(w["x0"]) == "player"]
+            players.sort(key=lambda w: w["top"])
+
+            carry = {"game_date": "", "game_time": "", "matchup": "", "team": ""}
+            for pw in players:
+                ptop = pw["top"]
+                same = [w for w in body if abs(w["top"] - ptop) <= 4]
+                cell = {}
+                for w in same:
+                    k = col_of(w["x0"])
+                    cell.setdefault(k, []).append(w["text"])
+                def get(k):
+                    return _respace(" ".join(cell.get(k, [])).strip())
+                player = get("player")
+                status = get("status")
+                team = get("team")
+                gd, gt, mu = get("game_date"), get("game_time"), get("matchup")
+                # NOT YET SUBMITTED appears in the player/status area
+                joined = (player + " " + status).lower()
+                if "not yet submitted" in joined:
+                    tm = team or carry["team"]
+                    if tm:
+                        not_submitted.append(tm)
+                    if team: carry["team"] = team
                     continue
-                rows.setdefault(round(w["top"]/3), []).append(w)
-            for _, ws in sorted(rows.items()):
-                ws.sort(key=lambda u: u["x0"])
-                cells = {k: [] for k in COL_KEYS}
-                for w in ws:
-                    cells[assign_col(cols, w["x0"])].append(w["text"])
-                cells = {k: " ".join(v).strip() for k, v in cells.items()}
-                line_all = " ".join(x for x in cells.values() if x)
-                if not line_all: continue
-                low = line_all.lower()
-                if low.startswith("injury report") or low.startswith("page "): continue
-                if "not yet submitted" in low:
-                    team = cells["team"] or carry["team"]
-                    if team: not_submitted.append(team)
-                    for k in ("game_date","game_time","matchup","team"):
-                        if cells[k]: carry[k] = cells[k]
+                if not player or not status:
                     continue
-                # carry forward blank leading columns
-                for k in ("game_date","game_time","matchup","team"):
-                    if cells[k]: carry[k] = cells[k]
-                    else: cells[k] = carry[k]
-                if cells["player"] and cells["status"]:
-                    entries.append({
-                        "game_date": cells["game_date"], "game_time": cells["game_time"],
-                        "matchup": cells["matchup"], "team": cells["team"],
-                        "player": cells["player"], "status": cells["status"].title(),
-                        "reason": cells["reason"],
-                    })
-                elif cells["reason"] and not cells["player"] and entries:
-                    entries[-1]["reason"] = (entries[-1]["reason"] + " " + cells["reason"]).strip()
+                # Reason: all reason-column tokens within a vertical band around the row
+                rtoks = [w for w in body
+                         if col_of(w["x0"]) == "reason" and (ptop - 9) <= w["top"] <= (ptop + 13)]
+                rtoks.sort(key=lambda w: w["top"])
+                reason = _respace(" ".join(t["text"] for t in rtoks))
+                reason = reason.replace('\" \"', "").replace('""', "")
+                # collapse "Injury/Illness - ; Illness" -> "Injury/Illness - Illness"
+                reason = re.sub(r'-\s*;', '-', reason)
+                reason = re.sub(r'\s{2,}', ' ', reason)
+                reason = re.sub(r'-\s*-', '-', reason).strip(' -;')
+                # carry-forward game columns
+                for k, v in (("game_date", gd), ("game_time", gt), ("matchup", mu), ("team", team)):
+                    if v:
+                        carry[k] = v
+                entries.append({
+                    "game_date": carry["game_date"], "game_time": carry["game_time"],
+                    "matchup": carry["matchup"], "team": team or carry["team"],
+                    "player": player, "status": status.title(), "reason": reason,
+                })
     return entries, not_submitted
 
 def fix_name(n):
