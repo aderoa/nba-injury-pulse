@@ -162,10 +162,21 @@ def _respace(t):
         return t
     # space between a lowercase/']' and an uppercase letter:  NewYork -> New York
     t = re.sub(r'(?<=[a-z\)\]\.;])(?=[A-Z])', ' ', t)
+    # END OF AN ALL-CAPITALS RUN:  LAClippers -> LA Clippers
+    #
+    # The rule above keys on a lowercase letter, so it cannot see the break in
+    # a run of capitals -- and the Clippers are the one team the league writes
+    # that way. "LAClippers" matched no key in TEAMS and was dropped exactly as
+    # Philadelphia was. Across the 22 October report this also repairs
+    # "G League", "ACL Repair" and "MCL Sprain", and changes nothing else.
+    t = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', t)
     # space between a letter and a digit:  Right5th -> Right 5th
     t = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', t)
     # digit followed by a letter, but NOT ordinal suffixes (5th, 2nd, 3rd, 1st)
-    t = re.sub(r'(?<=\d)(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', ' ', t)
+    # and NOT the 76ers, who are the reason this comment exists: the split
+    # produced "Philadelphia 76 ers", which matches no key in TEAMS, so every
+    # Philadelphia player was parsed correctly and then dropped in silence.
+    t = re.sub(r'(?<=\d)(?!(?:st|nd|rd|th|ers)\b)(?=[A-Za-z])', ' ', t)
     # space after a comma if missing:  Robinson,Mitchell -> Robinson, Mitchell
     t = re.sub(r',(?=\S)', ', ', t)
     # space around a dash used as separator:  Illness-RightHand -> Illness - Right Hand
@@ -176,6 +187,14 @@ def _respace(t):
 
 ASSIGN_TOL = 30  # x tolerance for column assignment
 
+# The line every page carries at the top:
+#   Injury Report: 10/22/26 04:45 PM Page2of4
+# On page 1 the real header sits below it and marks where the body starts. On
+# later pages there is no header, so this line is what the body has to clear.
+TITLE_RE = re.compile(
+    r'^(Injury|Report:?|\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}:\d{2}|[AP]M'
+    r'|Page\d+of\d+)$', re.I)
+
 def parse_pdf(pdf_bytes):
     """Return (entries, not_submitted_teams) parsed from the real NBA layout.
 
@@ -185,12 +204,40 @@ def parse_pdf(pdf_bytes):
     same line and Reason from every reason-column token within a vertical band.
     """
     entries, not_submitted = [], []
+    carry_cols = None          # the last header we saw, reused by later pages
+    # THE TEAM CARRIES ACROSS PAGES, because its blocks do.
+    #
+    # carry was reset at the top of every page, so when a team's listing
+    # straddled a page break the rows on the far side arrived with no team at
+    # all -- eight of them in the 22 October report, and the reason Chicago
+    # showed one player of six.
+    carry = {"game_date": "", "game_time": "", "matchup": "", "team": ""}
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
             hdr = [{"text": w["text"], "x0": w["x0"], "top": w["top"]} for w in words]
             cols, header_top = column_bounds(hdr)
-            if not cols:
+            if cols:
+                carry_cols = cols
+            elif carry_cols:
+                # ONE TABLE, CONTINUED -- NOT A PAGE WITHOUT DATA.
+                #
+                # The NBA prints the column header on page 1 only. This loop
+                # used to `continue` whenever it could not find one, which
+                # threw away pages 2, 3 and 4 of a four-page report: nine
+                # teams' listings and every NOT YET SUBMITTED marker. The
+                # columns do not move, so the ones from page 1 still apply.
+                cols = carry_cols
+                # With no header to clear, the body starts below the page's
+                # own title line -- the FIRST one. "Page2of4" also matches the
+                # title pattern and sits in the footer at the bottom of the
+                # page, so taking the largest top excluded every row above it,
+                # which is to say all of them.
+                tops = sorted(w["top"] for w in words
+                              if TITLE_RE.match(w["text"]))
+                header_top = (max(t for t in tops if t <= tops[0] + 5)
+                              if tops else None)
+            else:
                 continue
             colx = {k: x for x, k in cols}
 
@@ -205,11 +252,26 @@ def parse_pdf(pdf_bytes):
             body = [w for w in words if header_top is None or w["top"] > header_top + 3]
             body = [w for w in body if not w["text"].lower().startswith("page")]
 
-            # player-row anchors: tokens assigned to the player column
-            players = [w for w in body if col_of(w["x0"]) == "player"]
+            # Row anchors: a token in the player column -- or, for a team
+            # that has not filed, the NOT YET SUBMITTED marker.
+            #
+            # THE MARKER IS NOT IN THE PLAYER AREA. The league prints it in
+            # the REASON column (x0 ~667, against a reason bound of 666) on a
+            # line that carries a team and no player token at all. Anchoring
+            # rows on the player column alone meant such a line never became
+            # a row, so the test for the marker further down could not fire
+            # however the marker was spelled -- and thirteen teams that had
+            # not filed were published as teams with nothing to report.
+            def _is_nys(w):
+                return (col_of(w["x0"]) == "reason"
+                        and re.sub(r"\s+", "", w["text"]).upper()
+                            == "NOTYETSUBMITTED")
+
+            players = [w for w in body
+                       if col_of(w["x0"]) == "player" or _is_nys(w)]
             players.sort(key=lambda w: w["top"])
 
-            carry = {"game_date": "", "game_time": "", "matchup": "", "team": ""}
+            # carry lives OUTSIDE the page loop -- see parse_pdf's opening.
             for pw in players:
                 ptop = pw["top"]
                 same = [w for w in body if abs(w["top"] - ptop) <= 4]
@@ -224,8 +286,17 @@ def parse_pdf(pdf_bytes):
                 team = get("team")
                 gd, gt, mu = get("game_date"), get("game_time"), get("matchup")
                 # NOT YET SUBMITTED appears in the player/status area
-                joined = (player + " " + status).lower()
-                if "not yet submitted" in joined:
+                # AND THIS PDF HAS NO SPACE GLYPHS, so the marker arrives
+                # as the single token "NOTYETSUBMITTED". _respace cannot split
+                # it -- its rules key on case and digit changes, and an
+                # all-capitals run gives them nothing to work with -- so the
+                # spaced form is matched by removing the spaces from both
+                # sides rather than hoping for them. The reason column joins
+                # player and status here because that is where the marker
+                # sits; a real listing's reason never contains this text.
+                joined = re.sub(r"\s+", "",
+                                player + status + get("reason")).lower()
+                if "notyetsubmitted" in joined:
                     tm = team or carry["team"]
                     if tm:
                         not_submitted.append(tm)
