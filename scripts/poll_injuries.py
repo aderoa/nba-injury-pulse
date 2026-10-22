@@ -195,6 +195,27 @@ TITLE_RE = re.compile(
     r'^(Injury|Report:?|\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}:\d{2}|[AP]M'
     r'|Page\d+of\d+)$', re.I)
 
+def _respace_name(t):
+    """Undo the splits that only make sense for ordinary words.
+
+    _respace cannot tell "NewYork" from "McCullar": both are a lowercase
+    letter against a capital. Words want the space, names do not, so the
+    player column gets this second pass.
+    """
+    if not t:
+        return t
+    # "Alexander - Walker" -> "Alexander-Walker". The spaced form is correct
+    # for a reason ("Injury/Illness - Left Knee") and wrong for a name, which
+    # is the whole reason names are handled apart from everything else.
+    t = re.sub(r"\s*-\s*", "-", t)
+    # "Mc Cullar" -> "McCullar", "Le Bron" -> "LeBron", "Di Vincenzo" ->
+    # "DiVincenzo". Blunt, and safe here for one specific reason: this PDF
+    # contains no space glyphs, so every space in t was inserted by _respace
+    # a moment ago and none of them came from the league.
+    t = re.sub(r"\b(Mc|Mac|Di|De|Du|La|Le|Van|Von|O')\s+(?=[A-Z])", r"\1", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
 def parse_pdf(pdf_bytes):
     """Return (entries, not_submitted_teams) parsed from the real NBA layout.
 
@@ -281,7 +302,7 @@ def parse_pdf(pdf_bytes):
                     cell.setdefault(k, []).append(w["text"])
                 def get(k):
                     return _respace(" ".join(cell.get(k, [])).strip())
-                player = get("player")
+                player = _respace_name(get("player"))
                 status = get("status")
                 team = get("team")
                 gd, gt, mu = get("game_date"), get("game_time"), get("matchup")
