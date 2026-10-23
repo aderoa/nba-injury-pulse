@@ -308,6 +308,36 @@ def parse_pdf(pdf_bytes):
                        if col_of(w["x0"]) == "player" or _is_nys(w)]
             players.sort(key=lambda w: w["top"])
 
+            # A REASON THAT WRAPPED ACROSS THE PAGE BREAK.
+            #
+            # This loop reads one page at a time, so the last row on a page
+            # keeps whatever part of its reason was printed above the break
+            # and loses the rest, which arrives here with no row of its own:
+            #
+            #     page 3, last row   Sheppard, Reed  ...LeftKneeContusion/
+            #     page 4, first line                 BoneBruise
+            #
+            # Worse than losing it, it FLAPS: which player lands last on a
+            # page moves from report to report, so the same reason is
+            # truncated, restored, truncated again -- and each flip was
+            # published as a reason change that never happened.
+            #
+            # Measured across both reports in hand, a reason token sits at
+            # exactly -7, 0 or +7 from its own row and never further, while
+            # this orphan is 23 above the first row. 11 separates them with
+            # room to spare.
+            if entries and players:
+                _first = players[0]["top"]
+                _tail = [w for w in body
+                         if col_of(w["x0"]) == "reason"
+                         and w["top"] < _first - 11]
+                if _tail:
+                    _tail.sort(key=lambda w: (w["top"], w["x0"]))
+                    _extra = _respace(" ".join(t["text"] for t in _tail))
+                    entries[-1]["reason"] = re.sub(
+                        r"\s{2,}", " ",
+                        (entries[-1]["reason"] + " " + _extra)).strip()
+
             # carry lives OUTSIDE the page loop -- see parse_pdf's opening.
             for pw in players:
                 ptop = pw["top"]
