@@ -77,6 +77,16 @@
     margin: 18px 0 14px;
   }
   .meta-controls { display: inline-flex; align-items: center; gap: 14px; }
+  /* How old the data is. Quiet when healthy -- a badge that shouts on a good
+     day is a badge nobody reads on a bad one. */
+  .age-ok { color: inherit; }
+  .age-warn, .age-bad { font-weight: 600; }
+  .age-warn { color: #a35c00; }
+  .age-bad  { color: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    .age-warn { color: #e0a33e; }
+    .age-bad  { color: #f2857c; }
+  }
   .refreshing { display: inline-flex; align-items: center; gap: 6px; }
   .spinner {
     width: 10px; height: 10px;
@@ -486,12 +496,42 @@ function renderChanges() {
   `).join('');
 }
 
+// HOW STALE IS TOO STALE.
+//
+// The poller runs every 15 minutes and the league files every 15, so one
+// missed cycle is noise and two is a fault. Beyond two hours the only thing
+// still running is GitHub's throttled cron, which delivers a handful of runs
+// a day -- the state this page sat in, looking perfectly healthy, while the
+// scheduled task on the desktop was failing to find its interpreter.
+const STALE_WARN_MIN = 35;
+const STALE_BAD_MIN  = 120;
+
+function ageText(minutes) {
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${Math.floor(minutes)}m ago`;
+  const h = Math.floor(minutes / 60), m = Math.floor(minutes % 60);
+  return m ? `${h}h ${m}m ago` : `${h}h ago`;
+}
+
 function renderTimestamp() {
   const el = document.getElementById('last-updated');
   if (!liveData) { el.textContent = '—'; return; }
   const polled = new Date(liveData.polled_at_utc);
   const reportTs = liveData.report_ts || '—';
-  el.textContent = `Last poll: ${polled.toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })} · report ${reportTs}`;
+  const clock = polled.toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+
+  // polled_at_utc, NOT report_ts. poll_injuries.py refreshes polled_at on
+  // every run including the early return for a report it has already seen,
+  // so this going stale always means the poller stopped. report_ts sits
+  // still overnight by design and would raise a false alarm every night.
+  const mins = (Date.now() - polled.getTime()) / 60000;
+  let cls = 'age-ok', note = '';
+  if (mins >= STALE_BAD_MIN)       { cls = 'age-bad';  note = ' — not polling'; }
+  else if (mins >= STALE_WARN_MIN) { cls = 'age-warn'; note = ' — stale'; }
+
+  el.innerHTML = `Last poll: ${escapeHtml(clock)} `
+    + `<span class="${cls}">(${escapeHtml(ageText(mins) + note)})</span>`
+    + ` · report ${escapeHtml(reportTs)}`;
 }
 
 async function fetchData() {
@@ -524,6 +564,14 @@ document.querySelectorAll('.filter-pill').forEach(btn => {
 
 fetchData();
 setInterval(fetchData, 60000);
+// THE AGE HAS TO TICK WITHOUT A FETCH.
+//
+// renderTimestamp used to run only after a successful fetch, so on a page
+// whose fetches were failing the age would freeze at its last good value --
+// the failure concealing itself, which is precisely what this is for. This
+// re-renders from the stored timestamp, so the number climbs whether or not
+// anything is reachable.
+setInterval(() => { if (liveData) renderTimestamp(); }, 30000);
 </script>
 </body>
 </html>
