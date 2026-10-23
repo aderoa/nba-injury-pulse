@@ -473,10 +473,28 @@ def main():
     ts = datetime.now(timezone.utc).isoformat()
     prev = state.get("snapshot", {})
 
-    # WHO FILED. In the team column and not marked NOT YET SUBMITTED. A team
-    # that filed with nobody listed belongs here too, with an empty dict --
-    # that is a real statement about tonight and diffs correctly as such.
-    filed = {t for t in seen_teams if t not in not_submitted}
+    # WHO FILED.
+    #
+    # Three ways to qualify, and the third one is the whole point:
+    #
+    #   * in the team column and not marked NOT YET SUBMITTED -- including a
+    #     team that listed nobody, whose empty dict is a real statement about
+    #     tonight and diffs correctly as such;
+    #   * and ANY team with a listing parsed from this report, even if the
+    #     report also marks it NOT YET SUBMITTED.
+    #
+    # ONE REPORT COVERS TWO GAME DAYS. A team is listed for tonight and
+    # marked NOT YET SUBMITTED for tomorrow, in the same PDF. Testing the
+    # marker at team level excluded such a team from `filed`, which threw
+    # away the rows just parsed for tonight and carried the previous listing
+    # instead -- ten of the thirty teams on the 23 October 10:30 AM report,
+    # Chicago among them, with two players moved to Probable during the
+    # morning that were parsed correctly and discarded on every run.
+    #
+    # Their cards gave it away: last_submitted_ts stayed None for exactly
+    # those ten while the other thirteen were stamped.
+    filed = ({t for t in seen_teams if t not in not_submitted}
+             | set(filed_now))
 
     # LAST KNOWN STATE, team by team. Everything carries; the teams that
     # filed are overwritten with what they just said.
