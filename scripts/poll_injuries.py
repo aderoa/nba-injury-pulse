@@ -47,6 +47,9 @@ MAX_PROBES = 130          # 15-min slots ≈ 32h of lookback
 PROBE_DELAY = 0.15
 RECENT_CHANGES_MAX = 300
 RECENT_CHANGES_DAYS = 10
+# How long a team's last filed listing is carried while it files nothing new.
+# In season every team plays well inside this.
+CARRY_DAYS = 4
 
 TEAMS = {  # full name -> (abbr, short)
     "Atlanta Hawks":("ATL","Hawks"),"Boston Celtics":("BOS","Celtics"),
@@ -224,7 +227,7 @@ def parse_pdf(pdf_bytes):
     rows (a token in the Player column), then for each, gather Status from the
     same line and Reason from every reason-column token within a vertical band.
     """
-    entries, not_submitted = [], []
+    entries, not_submitted, seen_teams = [], [], set()
     carry_cols = None          # the last header we saw, reused by later pages
     # THE TEAM CARRIES ACROSS PAGES, because its blocks do.
     #
@@ -272,6 +275,19 @@ def parse_pdf(pdf_bytes):
 
             body = [w for w in words if header_top is None or w["top"] > header_top + 3]
             body = [w for w in body if not w["text"].lower().startswith("page")]
+
+            # WHO IS ON THIS REPORT AT ALL.
+            #
+            # Taken from the TEAM COLUMN, not from the player rows, because a
+            # team can be covered by the report and list nobody -- and that is
+            # not the same thing as a team with no game, though the player
+            # rows cannot tell them apart. Every team the report covers is
+            # printed in this column exactly once per block.
+            for w in body:
+                if col_of(w["x0"]) == "team":
+                    nm = _respace(w["text"])
+                    if nm in TEAMS:
+                        seen_teams.add(nm)
 
             # Row anchors: a token in the player column -- or, for a team
             # that has not filed, the NOT YET SUBMITTED marker.
@@ -344,13 +360,37 @@ def parse_pdf(pdf_bytes):
                     "matchup": carry["matchup"], "team": team or carry["team"],
                     "player": player, "status": status.title(), "reason": reason,
                 })
-    return entries, not_submitted
+    return entries, not_submitted, seen_teams
+
+# A generational suffix, and nothing else: Jr Sr II III IV V, with or
+# without a period, in any case. No first name is spelled like one, which is
+# what makes the test below safe.
+SUFFIX_ONLY = re.compile(r"^(?:Jr|Sr|I{2,3}|IV|V)\.?$", re.I)
+
 
 def fix_name(n):
-    """'James, LeBron' -> 'LeBron James' (suffix-aware)."""
-    m = re.match(r"^([^,]+),\s*(.+)$", n.strip())
-    if not m: return n.strip()
-    last, first = m.group(1).strip(), m.group(2).strip()
+    """'James, LeBron' -> 'LeBron James' (suffix-aware, either ordering)."""
+    # A comma on the end is a typo, not an empty field. Without this,
+    # "Ernest Udeh, Jr.," hands a first name of "Jr.," to the code below.
+    n = n.strip().rstrip(",").strip()
+    m = re.match(r"^([^,]+),\s*(.+)$", n)
+    if not m:
+        return n
+    head, tail = m.group(1).strip(), m.group(2).strip().rstrip(",").strip()
+
+    # ALREADY FIRST-LAST, WITH THE SUFFIX AFTER THE COMMA.
+    #
+    # The report writes "Last, First" almost without exception, but on the
+    # 22 October 11:10 PM report one entry read "Ernest Udeh, Jr.," and the
+    # old code swapped it into "Jr., Ernest Udeh" -- which posted to the
+    # change log as an added player and then as a cleared one.
+    #
+    # The suffix is the only token that can settle which ordering was meant,
+    # so it is the only thing this looks at.
+    if SUFFIX_ONLY.match(tail):
+        return f"{head} {tail}"
+
+    last, first = head, tail
     sfx = ""
     for s in (" Jr.", " Sr.", " III", " II", " IV", " Jr", " Sr"):
         if last.endswith(s):
@@ -423,15 +463,34 @@ def main():
         return
 
     log(f"new report: {url}")
-    entries, not_submitted = parse_pdf(download(url))
+    entries, not_submitted, seen_teams = parse_pdf(download(url))
     log(f"parsed {len(entries)} player listings; {len(not_submitted)} teams not yet submitted")
     if not entries and not not_submitted:
         log("PARSE WARNING: nothing extracted — format may have changed; keeping previous state")
         return
 
-    cur = build_snapshot(entries)
+    filed_now = build_snapshot(entries)
     ts = datetime.now(timezone.utc).isoformat()
-    changes = diff(state.get("snapshot", {}), cur, ts) if state.get("snapshot") is not None else []
+    prev = state.get("snapshot", {})
+
+    # WHO FILED. In the team column and not marked NOT YET SUBMITTED. A team
+    # that filed with nobody listed belongs here too, with an empty dict --
+    # that is a real statement about tonight and diffs correctly as such.
+    filed = {t for t in seen_teams if t not in not_submitted}
+
+    # LAST KNOWN STATE, team by team. Everything carries; the teams that
+    # filed are overwritten with what they just said.
+    known = dict(prev)
+    for t in filed:
+        known[t] = filed_now.get(t, {})
+
+    # ONLY THE TEAMS THAT FILED ARE DIFFED. Narrowing both sides to `filed`
+    # lets diff() stay exactly as it is: a team that said nothing tonight
+    # appears on neither side, so it cannot produce an event. This is the
+    # whole fix -- the rest is bookkeeping.
+    changes = (diff({t: prev.get(t, {}) for t in filed},
+                    {t: known[t] for t in filed}, ts)
+               if state.get("snapshot") is not None else [])
     first_run = "snapshot" not in state
     if first_run:
         log("first run — establishing baseline, not emitting per-player changes")
@@ -443,25 +502,48 @@ def main():
     recent = [c for c in recent if c["ts"] >= cutoff][:RECENT_CHANGES_MAX]
 
     report_ts = slot.strftime("%Y-%m-%d %I:%M %p ET") if slot else ""
+    # WHEN EACH TEAM LAST FILED, as the report's own slot rather than our
+    # polling time, so the page's "as of" means what a reader would assume.
+    # Stored in UTC because that is what the page can parse.
+    filed_ts = dict(state.get("filed_ts", {}))
+    if slot is not None:
+        _s = slot if slot.tzinfo else slot.replace(tzinfo=timezone(timedelta(hours=-4)))
+        filed_iso = _s.astimezone(timezone.utc).isoformat()
+    else:
+        filed_iso = ts
+    for t in filed:
+        filed_ts[t] = filed_iso
+
+    # BOUNDED CARRY. A listing nobody has reconfirmed in CARRY_DAYS is
+    # dropped rather than shown forever. A team with no recorded filing time
+    # predates this change, so it is kept until it next files -- otherwise
+    # the first run after this patch would wipe every listing it inherited.
+    _cut = (datetime.now(timezone.utc) - timedelta(days=CARRY_DAYS)).isoformat()
+    for t in list(known):
+        if t not in filed and t in filed_ts and filed_ts[t] < _cut:
+            known.pop(t, None)
+            filed_ts.pop(t, None)
+
     teams_out = []
     for full in sorted(TEAMS, key=lambda x: TEAMS[x][0]):
         if full == "Los Angeles Clippers":  # alias of LA Clippers
             continue
-        players = cur.get(full) or cur.get("Los Angeles Clippers" if full == "LA Clippers" else "", {})
+        players = known.get(full) or known.get("Los Angeles Clippers" if full == "LA Clippers" else "", {})
         plist = [{"name": n, "status": v["status"], "reason": v["reason"],
                   "game_date": v["game_date"], "matchup": v["matchup"]}
                  for n, v in sorted(players.items())]
         order = {"Out":0,"Doubtful":1,"Questionable":2,"Probable":3,"Available":4}
         plist.sort(key=lambda p,o=order: (o.get(p["status"],9), p["name"]))
         teams_out.append({"team_abbr": TEAMS[full][0], "team_full": full,
-                          "last_submitted_ts": None,
+                          "last_submitted_ts": filed_ts.get(full),
                           "not_yet_submitted": full in not_submitted,
                           "players": plist})
 
     live = {"polled_at_utc": ts, "report_ts": report_ts, "report_url": url,
             "teams": teams_out, "recent_changes": recent}
     json.dump(live, open(LIVE_PATH, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
-    json.dump({"report_url": url, "report_ts": report_ts, "snapshot": cur,
+    json.dump({"report_url": url, "report_ts": report_ts, "snapshot": known,
+               "filed_ts": filed_ts,
                "recent_changes": recent, "updated_at": ts},
               open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     log(f"wrote live json: {sum(len(t['players']) for t in teams_out)} listings, "
