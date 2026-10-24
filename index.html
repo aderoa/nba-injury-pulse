@@ -77,6 +77,18 @@
     margin: 18px 0 14px;
   }
   .meta-controls { display: inline-flex; align-items: center; gap: 14px; }
+  /* The bell. Quiet until it is on, and gone entirely where the browser
+     has no Notification API to offer. */
+  .notify-btn {
+    font: inherit; color: var(--muted); background: none; cursor: pointer;
+    border: 1px solid var(--border, #d8dade); border-radius: 999px;
+    padding: 2px 10px; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .notify-btn:hover { color: inherit; }
+  .notify-btn[hidden] { display: none; }
+  .notify-btn.on { color: #1a7f37; border-color: currentColor; }
+  .notify-btn:disabled { cursor: default; opacity: .55; }
+  @media (prefers-color-scheme: dark) { .notify-btn.on { color: #4ac26b; } }
   /* How old the data is. Quiet when healthy -- a badge that shouts on a good
      day is a badge nobody reads on a bad one. */
   .age-ok { color: inherit; }
@@ -325,6 +337,7 @@
   <span id="last-updated">Loading…</span>
   <div class="meta-controls">
     <span class="refreshing"><span class="spinner"></span> auto-refresh 60s</span>
+    <button class="notify-btn" id="notify-btn" hidden type="button"></button>
   </div>
 </div>
 
@@ -542,6 +555,7 @@ async function fetchData() {
     renderTabs();
     updateView();
     renderTimestamp();
+    notifyScan();
   } catch (e) {
     console.error('Fetch failed:', e);
     document.getElementById('last-updated').innerHTML =
@@ -561,6 +575,131 @@ document.querySelectorAll('.filter-pill').forEach(btn => {
     renderCurrent();
   });
 });
+
+// ---------------------------------------------------------------- notify
+//
+// A desktop notification when the log moves. No service worker and no server:
+// this fires from the open tab, which is all it claims to do.
+
+const NOTIFY_PREF = 'pulse_notify';
+let notifyOn = false;
+let notifySeeded = false;             // the first fetch only seeds; see below
+const notifySeen = new Set();
+
+// Identity of a change. ts alone is not enough -- one poll stamps every event
+// it finds with the same instant, so fifty-five entries would collapse to one.
+function changeKey(c) {
+  return [c.ts, c.type, c.player || '', c.team_abbr || ''].join('|');
+}
+
+// The log's own wording, with the markup taken off, so the notification and
+// the row can never drift. changeText already escapes its inputs; textContent
+// then gives back the characters rather than the entities.
+function plainChange(c) {
+  const d = document.createElement('div');
+  d.innerHTML = changeText(c);
+  return (d.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
+function notifySupported() {
+  return typeof Notification !== 'undefined';
+}
+
+function notifyStore(on) {
+  try { localStorage.setItem(NOTIFY_PREF, on ? '1' : '0'); } catch (e) { /* private window */ }
+}
+
+function notifyRestore() {
+  try { return localStorage.getItem(NOTIFY_PREF) === '1'; } catch (e) { return false; }
+}
+
+function renderNotifyBtn() {
+  const b = document.getElementById('notify-btn');
+  if (!b) return;
+  if (!notifySupported()) { b.hidden = true; return; }
+  b.hidden = false;
+  b.disabled = Notification.permission === 'denied';
+  if (Notification.permission === 'denied') {
+    b.textContent = '\u{1F515} blocked';
+    b.title = 'Notifications are blocked for this site in your browser settings.';
+  } else if (notifyOn) {
+    b.textContent = '\u{1F514} notifying';
+    b.title = 'Click to stop notifying.';
+  } else {
+    b.textContent = '\u{1F514} notify';
+    b.title = 'Notify me when the log moves, while this tab is open.';
+  }
+  b.classList.toggle('on', notifyOn);
+}
+
+// Only when you would not have seen it anyway: hidden tab, or a visible tab
+// parked on Current. Looking straight at the log needs no toast.
+function notifyWorthIt() {
+  return document.hidden || currentTab !== 'CHANGES';
+}
+
+function notifyOfChanges(fresh) {
+  if (!fresh.length || !notifyOn || !notifySupported()) return;
+  if (Notification.permission !== 'granted' || !notifyWorthIt()) return;
+  const first = plainChange(fresh[0]);
+  const title = fresh.length === 1 ? 'Injury update'
+                                   : `${fresh.length} injury updates`;
+  const body = fresh.length === 1 ? first
+             : fresh.length === 2 ? first + '\n' + plainChange(fresh[1])
+             : first + '\n+' + (fresh.length - 1) + ' more';
+  try {
+    // One tag, so a later batch replaces an unread one instead of stacking a
+    // tray full of them. The page holds the full history either way.
+    const n = new Notification(title, { body, tag: 'nba-injury-pulse',
+                                        renotify: true });
+    n.onclick = () => {
+      window.focus();
+      currentTab = 'CHANGES';
+      history.replaceState(null, '', '#CHANGES');
+      renderTabs();
+      updateView();
+      n.close();
+    };
+  } catch (e) {
+    console.error('Notification failed:', e);
+  }
+}
+
+// Called after every successful fetch. The first one seeds and stays silent,
+// so opening the page does not announce three days of history.
+function notifyScan() {
+  const list = (liveData && liveData.recent_changes) || [];
+  if (!notifySeeded) {
+    list.forEach(c => notifySeen.add(changeKey(c)));
+    notifySeeded = true;
+    return;
+  }
+  const fresh = [];
+  for (const c of list) {
+    const k = changeKey(c);
+    if (!notifySeen.has(k)) { notifySeen.add(k); fresh.push(c); }
+  }
+  notifyOfChanges(fresh);
+}
+
+(function wireNotify() {
+  const b = document.getElementById('notify-btn');
+  if (!b || !notifySupported()) { renderNotifyBtn(); return; }
+  notifyOn = notifyRestore() && Notification.permission === 'granted';
+  b.addEventListener('click', async () => {
+    if (notifyOn) { notifyOn = false; notifyStore(false); renderNotifyBtn(); return; }
+    // Asked on the click, never on load: browsers reject it otherwise.
+    let perm = Notification.permission;
+    if (perm === 'default') {
+      try { perm = await Notification.requestPermission(); }
+      catch (e) { perm = Notification.permission; }
+    }
+    notifyOn = perm === 'granted';
+    notifyStore(notifyOn);
+    renderNotifyBtn();
+  });
+  renderNotifyBtn();
+})();
 
 fetchData();
 setInterval(fetchData, 60000);
