@@ -609,8 +609,13 @@ function notifyStore(on) {
   try { localStorage.setItem(NOTIFY_PREF, on ? '1' : '0'); } catch (e) { /* private window */ }
 }
 
+// ON UNLESS TURNED OFF. The preference is absent until the bell is clicked,
+// and absent now means on -- so once the browser has granted permission, a
+// new session notifies without being asked again. Only an explicit stop
+// writes '0'. A private window cannot read it back and defaults to on, which
+// is the harmless direction.
 function notifyRestore() {
-  try { return localStorage.getItem(NOTIFY_PREF) === '1'; } catch (e) { return false; }
+  try { return localStorage.getItem(NOTIFY_PREF) !== '0'; } catch (e) { return true; }
 }
 
 function renderNotifyBtn() {
@@ -632,15 +637,17 @@ function renderNotifyBtn() {
   b.classList.toggle('on', notifyOn);
 }
 
-// Only when you would not have seen it anyway: hidden tab, or a visible tab
-// parked on Current. Looking straight at the log needs no toast.
-function notifyWorthIt() {
-  return document.hidden || currentTab !== 'CHANGES';
-}
+// NO CLEVERNESS ABOUT WHETHER YOU WOULD HAVE SEEN IT.
+//
+// This used to stay silent when the Changes tab was open and visible, on the
+// theory that a row appearing in front of you needs no toast. But the page
+// opens on #CHANGES from a bookmark, so the first thing it did was nothing --
+// indistinguishable from a broken feature. Silence you cannot account for
+// costs more than a toast you did not need.
 
 function notifyOfChanges(fresh) {
   if (!fresh.length || !notifyOn || !notifySupported()) return;
-  if (Notification.permission !== 'granted' || !notifyWorthIt()) return;
+  if (Notification.permission !== 'granted') return;
   const first = plainChange(fresh[0]);
   const title = fresh.length === 1 ? 'Injury update'
                                    : `${fresh.length} injury updates`;
