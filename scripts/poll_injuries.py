@@ -465,8 +465,12 @@ def diff(prev, cur, ts):
                                     "from_status": p[name]["status"], "to_status": c[name]["status"],
                                     "reason": c[name]["reason"]})
                 elif (p[name].get("reason") or "") != (c[name].get("reason") or ""):
+                    # from_reason makes the entry a transition rather than a
+                    # result. Entries already in recent_changes have no such
+                    # key and the page handles their absence.
                     changes.append({"ts": ts, "type": "reason_change", "player": name, "team_abbr": abbr,
-                                    "status": c[name]["status"], "reason": c[name]["reason"]})
+                                    "status": c[name]["status"], "reason": c[name]["reason"],
+                                    "from_reason": p[name].get("reason") or ""})
         for name in p:
             if name not in c:
                 changes.append({"ts": ts, "type": "cleared", "player": name, "team_abbr": abbr,

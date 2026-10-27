@@ -475,7 +475,18 @@ function changeText(c) {
     return `<strong>${escapeHtml(c.player)}</strong> (${escapeHtml(c.team_abbr)}): <strong>${escapeHtml(c.from_status)}</strong> → <strong>${escapeHtml(c.to_status)}</strong>${c.reason ? ` — ${escapeHtml(c.reason)}` : ''}`;
   }
   if (c.type === 'reason_change') {
-    return `<strong>${escapeHtml(c.player)}</strong> (${escapeHtml(c.team_abbr)}, ${escapeHtml(c.status)}): reason updated`;
+    // The event has always carried the new reason -- the page simply never
+    // printed it, so this reads correctly on entries already in the log.
+    //
+    // from_reason is newer, so it is tested rather than assumed: older rows
+    // show the new reason alone, newer ones show the transition. recent_changes
+    // entries are immutable, so handling both shapes is the only option.
+    const to = c.reason ? escapeHtml(c.reason) : '';
+    const from = c.from_reason ? escapeHtml(c.from_reason) : '';
+    const head = `<strong>${escapeHtml(c.player)}</strong> (${escapeHtml(c.team_abbr)}, ${escapeHtml(c.status)}): `;
+    if (from && to) return head + `${from} \u2192 <strong>${to}</strong>`;
+    if (to) return head + `reason now <strong>${to}</strong>`;
+    return head + 'reason updated';
   }
   return JSON.stringify(c);
 }
